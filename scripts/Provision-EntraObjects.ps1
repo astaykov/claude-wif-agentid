@@ -154,12 +154,15 @@ Write-Host ""
 Write-Host "Next steps — Anthropic Console:" -ForegroundColor Yellow
 Write-Host "  1. Create a Service Account in the Anthropic Console."
 Write-Host "     Set ANTHROPIC_SERVICE_ACCOUNT_ID=<svac_...> in your .env."
-Write-Host "  2. Create a Federation Issuer:"
+Write-Host "  2. Note your Organization ID from the Console Organization settings page."
+Write-Host "     Set ANTHROPIC_ORGANIZATION_ID=<UUID> in your .env."
+Write-Host "  3. Create a Federation Issuer:"
 Write-Host "     Issuer URL : https://login.microsoftonline.com/$TenantId/v2.0"
 Write-Host "     Audience   : api://$($blueprint.AppId)"
-Write-Host "  3. Create a Federation Rule mapping the Agent Identity's token claims"
+Write-Host "  4. Create a Federation Rule mapping the Agent Identity's token claims"
 Write-Host "     (e.g. appid=$($agentApp.AppId)) to your service account."
-Write-Host "  4. See README for full instructions."
+Write-Host "     Set ANTHROPIC_FEDERATION_RULE_ID=<fdrl_...> in your .env."
+Write-Host "  5. See README for full instructions."
 Write-Host ""
 
 if ($UseWIF) {

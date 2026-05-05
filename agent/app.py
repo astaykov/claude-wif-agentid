@@ -48,6 +48,8 @@ AGENT_APP_ID = os.environ.get("AGENT_APP_ID", "")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
 ANTHROPIC_API_BASE = os.environ.get("ANTHROPIC_API_BASE", "https://api.anthropic.com")
 ANTHROPIC_SERVICE_ACCOUNT_ID = os.environ.get("ANTHROPIC_SERVICE_ACCOUNT_ID", "")
+ANTHROPIC_ORGANIZATION_ID = os.environ.get("ANTHROPIC_ORGANIZATION_ID", "")
+ANTHROPIC_FEDERATION_RULE_ID = os.environ.get("ANTHROPIC_FEDERATION_RULE_ID", "")
 DOWNSTREAM_API_NAME = "claude-api"  # matches DownstreamApis__claude-api__* in sidecar config
 
 
@@ -107,15 +109,21 @@ def exchange_entra_jwt_for_claude_token(entra_jwt: str) -> str:
     Exchange an Entra Agent Identity JWT for a short-lived Anthropic access token
     using the RFC 7523 jwt-bearer grant (Anthropic Workload Identity Federation).
 
-    POST /v1/oauth/token
-      grant_type = urn:ietf:params:oauth:grant-type:jwt-bearer
-      assertion  = <Entra JWT>
-      client_id  = <Anthropic service account ID (svac_...)>
+    POST /v1/oauth/token  (application/x-www-form-urlencoded)
+      grant_type         = urn:ietf:params:oauth:grant-type:jwt-bearer
+      assertion          = <raw Entra JWT>
+      federation_rule_id = fdrl_... (rule configured in Anthropic Console)
+      organization_id    = <Anthropic org UUID>
+      service_account_id = svac_...
 
     Returns the short-lived Claude access token string.
     """
     if not ANTHROPIC_SERVICE_ACCOUNT_ID:
         raise ValueError("ANTHROPIC_SERVICE_ACCOUNT_ID is not configured")
+    if not ANTHROPIC_ORGANIZATION_ID:
+        raise ValueError("ANTHROPIC_ORGANIZATION_ID is not configured")
+    if not ANTHROPIC_FEDERATION_RULE_ID:
+        raise ValueError("ANTHROPIC_FEDERATION_RULE_ID is not configured")
 
     token_url = f"{ANTHROPIC_API_BASE}/v1/oauth/token"
     log.info("[WIF] Exchanging Entra JWT for Claude token at %s", token_url)
@@ -125,16 +133,18 @@ def exchange_entra_jwt_for_claude_token(entra_jwt: str) -> str:
         data={
             "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
             "assertion": entra_jwt,
-            "client_id": ANTHROPIC_SERVICE_ACCOUNT_ID,
+            "federation_rule_id": ANTHROPIC_FEDERATION_RULE_ID,
+            "organization_id": ANTHROPIC_ORGANIZATION_ID,
+            "service_account_id": ANTHROPIC_SERVICE_ACCOUNT_ID,
         },
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=15,
     )
     resp.raise_for_status()
 
-    claude_token = resp.json()["access_token"]
-    log.info("[WIF] Claude access token obtained (expires_in=%s)",
-             resp.json().get("expires_in", "?"))
+    body = resp.json()
+    claude_token = body["access_token"]
+    log.info("[WIF] Claude access token obtained (expires_in=%s)", body.get("expires_in", "?"))
     return claude_token
 
 

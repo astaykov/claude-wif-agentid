@@ -131,19 +131,22 @@ enter in the Anthropic Console.
 
 In the [Anthropic Console](https://console.anthropic.com/) → Settings:
 
-1. **Create a Service Account** — note the `svac_...` ID.
-2. **Create a Federation Issuer**:
+1. **Create a Service Account** — note the `svac_...` ID → `ANTHROPIC_SERVICE_ACCOUNT_ID`.
+2. **Note your Organization ID** (UUID on the Organization settings page) → `ANTHROPIC_ORGANIZATION_ID`.
+3. **Create a Federation Issuer**:
    - Issuer URL: `https://login.microsoftonline.com/<tenant-id>/v2.0`
    - Audience: `api://<blueprint-app-id>` ← printed by the provisioning script
-3. **Create a Federation Rule** linking the issuer to the service account.
+4. **Create a Federation Rule** linking the issuer to the service account.
    Match on the `appid` claim equal to your Agent Identity Client ID.
+   Note the `fdrl_...` rule ID → `ANTHROPIC_FEDERATION_RULE_ID`.
 
 ### 3. Configure environment
 
 ```bash
 cp .env.example .env
 # Edit .env and fill in all values printed by the provisioning script,
-# plus your ANTHROPIC_SERVICE_ACCOUNT_ID from the Anthropic Console.
+# plus ANTHROPIC_SERVICE_ACCOUNT_ID, ANTHROPIC_ORGANIZATION_ID,
+# and ANTHROPIC_FEDERATION_RULE_ID from the Anthropic Console.
 ```
 
 ### 4. Run
@@ -241,7 +244,9 @@ Also add a FIC on the Blueprint app registration:
         │ POST api.anthropic.com/v1/oauth/token
         │   grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer
         │   assertion=<Entra JWT>
-        │   client_id=<Anthropic service account svac_...>
+        │   federation_rule_id=fdrl_...
+        │   organization_id=<Anthropic org UUID>
+        │   service_account_id=svac_...
         ▼
 [Short-lived Claude access token]
         │
