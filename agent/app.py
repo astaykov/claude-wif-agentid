@@ -178,7 +178,7 @@ def chat():
         }), 502
     except Exception as exc:  # pylint: disable=broad-except
         log.error("[Error] %s", exc)
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"error": "Internal server error"}), 500
 
 
 if __name__ == "__main__":
