@@ -1,6 +1,6 @@
 """
-Claude via Microsoft Foundry — Entra Agent ID WIF Proof of Concept
-===================================================================
+Claude API — Entra Agent ID WIF Proof of Concept
+=================================================
 This agent demonstrates the sidecar pattern for Workload Identity Federation:
 
   Workload runtime (Azure MI / K8s SA / GitHub OIDC)
@@ -8,23 +8,27 @@ This agent demonstrates the sidecar pattern for Workload Identity Federation:
         ▼
   Entra Agent ID Sidecar  ──── client credentials (or WIF assertion) ───▶  Entra ID
         │                                                                 (login.microsoft.com)
-        │  Authorization: Bearer <Agent ID token for cognitiveservices>
+        │  Entra Agent Identity JWT (scoped to Anthropic WIF audience)
         ▼
-  This agent  ──── POST /anthropic/v1/messages (Bearer token) ───▶  Claude via Microsoft Foundry
-        │                                                            (*.services.ai.azure.com)
+  This agent  ──── POST /v1/oauth/token (RFC 7523 jwt-bearer) ───▶  Anthropic WIF
+        │                                                            (api.anthropic.com)
+        │  Short-lived Claude access token
+        ▼
+  This agent  ──── POST /v1/messages (Bearer <claude_token>) ───▶  Claude API
+        │
         │  Claude response
         ▼
   Caller
 
-The agent code never handles credentials, secrets, or token exchange logic.
-All identity work is delegated to the Microsoft Entra SDK auth sidecar.
+The agent code never handles Entra credentials, secrets, or token exchange logic.
+All Entra identity work is delegated to the Microsoft Entra SDK auth sidecar.
+The only logic here is the RFC 7523 exchange of the Entra JWT for a Claude token.
 
 Supported flows:
   - Autonomous (app-only):  no user token required
   - OBO (on-behalf-of):     pass an Entra user Bearer token in the Authorization header
 """
 
-import json
 import logging
 import os
 
@@ -41,8 +45,9 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 SIDECAR_URL = os.environ.get("SIDECAR_URL", "http://sidecar:5000")
 AGENT_APP_ID = os.environ.get("AGENT_APP_ID", "")
-FOUNDRY_ENDPOINT = os.environ.get("FOUNDRY_ENDPOINT", "")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+ANTHROPIC_API_BASE = os.environ.get("ANTHROPIC_API_BASE", "https://api.anthropic.com")
+ANTHROPIC_SERVICE_ACCOUNT_ID = os.environ.get("ANTHROPIC_SERVICE_ACCOUNT_ID", "")
 DOWNSTREAM_API_NAME = "claude-api"  # matches DownstreamApis__claude-api__* in sidecar config
 
 
@@ -50,16 +55,19 @@ DOWNSTREAM_API_NAME = "claude-api"  # matches DownstreamApis__claude-api__* in s
 # Sidecar integration
 # ---------------------------------------------------------------------------
 
-def get_agent_auth_header(user_token: str | None = None) -> str:
+def get_entra_agent_jwt(user_token: str | None = None) -> str:
     """
-    Ask the Entra SDK sidecar for an Authorization header scoped to
-    https://cognitiveservices.azure.com/.default (Microsoft Foundry / Claude).
+    Ask the Entra SDK sidecar for an Entra Agent Identity JWT scoped to the
+    audience configured for Anthropic WIF (ENTRA_WIF_SCOPE in sidecar config).
 
     Autonomous flow: sidecar does client-credentials (or WIF via managed identity
     assertion) to obtain an Agent Identity token.  No user_token needed.
 
     OBO flow: the caller's Entra Bearer token is forwarded to the sidecar, which
     performs the On-Behalf-Of exchange to mint an agent-on-behalf-of-user token.
+
+    Returns the raw JWT string (without the "Bearer " prefix) for use in the
+    Anthropic RFC 7523 token exchange.
     """
     params = {
         "DownstreamApi": DOWNSTREAM_API_NAME,
@@ -69,7 +77,7 @@ def get_agent_auth_header(user_token: str | None = None) -> str:
     if user_token:
         headers["Authorization"] = f"Bearer {user_token}"
 
-    log.info("[WIF] Requesting Agent ID token from sidecar (flow=%s)",
+    log.info("[WIF] Requesting Entra Agent ID JWT from sidecar (flow=%s)",
              "obo" if user_token else "autonomous")
 
     resp = requests.get(
@@ -82,25 +90,66 @@ def get_agent_auth_header(user_token: str | None = None) -> str:
 
     auth_header = resp.text.strip()
     # Log only the token type prefix for debugging, never the full token
-    log.info("[WIF] Token received: %s...", auth_header[:20])
+    log.info("[WIF] Entra JWT received: %s...", auth_header[:20])
+
+    # Strip "Bearer " prefix — the raw JWT is what Anthropic WIF expects
+    if auth_header.startswith("Bearer "):
+        return auth_header[len("Bearer "):]
     return auth_header
 
 
 # ---------------------------------------------------------------------------
-# Claude via Microsoft Foundry
+# Anthropic Workload Identity Federation — token exchange
 # ---------------------------------------------------------------------------
 
-def call_claude(auth_header: str, message: str, system: str | None = None) -> dict:
+def exchange_entra_jwt_for_claude_token(entra_jwt: str) -> str:
     """
-    Call Claude via the Microsoft Foundry endpoint using the Entra Agent ID
-    Bearer token obtained from the sidecar.  The Authorization header is the
-    WIF-derived token — no Anthropic API key is used.
-    """
-    if not FOUNDRY_ENDPOINT:
-        raise ValueError("FOUNDRY_ENDPOINT is not configured")
+    Exchange an Entra Agent Identity JWT for a short-lived Anthropic access token
+    using the RFC 7523 jwt-bearer grant (Anthropic Workload Identity Federation).
 
+    POST /v1/oauth/token
+      grant_type = urn:ietf:params:oauth:grant-type:jwt-bearer
+      assertion  = <Entra JWT>
+      client_id  = <Anthropic service account ID (svac_...)>
+
+    Returns the short-lived Claude access token string.
+    """
+    if not ANTHROPIC_SERVICE_ACCOUNT_ID:
+        raise ValueError("ANTHROPIC_SERVICE_ACCOUNT_ID is not configured")
+
+    token_url = f"{ANTHROPIC_API_BASE}/v1/oauth/token"
+    log.info("[WIF] Exchanging Entra JWT for Claude token at %s", token_url)
+
+    resp = requests.post(
+        token_url,
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": entra_jwt,
+            "client_id": ANTHROPIC_SERVICE_ACCOUNT_ID,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=15,
+    )
+    resp.raise_for_status()
+
+    claude_token = resp.json()["access_token"]
+    log.info("[WIF] Claude access token obtained (expires_in=%s)",
+             resp.json().get("expires_in", "?"))
+    return claude_token
+
+
+# ---------------------------------------------------------------------------
+# Claude API
+# ---------------------------------------------------------------------------
+
+def call_claude(claude_access_token: str, message: str, system: str | None = None) -> dict:
+    """
+    Call the Anthropic Claude API using the short-lived access token obtained
+    from the Anthropic WIF token exchange.  No Anthropic API key is used.
+    """
+    messages_url = f"{ANTHROPIC_API_BASE}/v1/messages"
     headers = {
-        "Authorization": auth_header,
+        "Authorization": f"Bearer {claude_access_token}",
         "Content-Type": "application/json",
         "anthropic-version": "2023-06-01",
     }
@@ -113,8 +162,8 @@ def call_claude(auth_header: str, message: str, system: str | None = None) -> di
     if system:
         payload["system"] = system
 
-    log.info("[Claude] POST %s model=%s", FOUNDRY_ENDPOINT, CLAUDE_MODEL)
-    resp = requests.post(FOUNDRY_ENDPOINT, headers=headers, json=payload, timeout=60)
+    log.info("[Claude] POST %s model=%s", messages_url, CLAUDE_MODEL)
+    resp = requests.post(messages_url, headers=headers, json=payload, timeout=60)
     resp.raise_for_status()
     return resp.json()
 
@@ -154,11 +203,14 @@ def chat():
     flow = "obo" if user_token else "autonomous"
 
     try:
-        # Step 1 — WIF: ask sidecar for Agent Identity token for Azure Cognitive Services
-        agent_auth_header = get_agent_auth_header(user_token)
+        # Step 1 — Sidecar: obtain Entra Agent Identity JWT (WIF or client-credentials)
+        entra_jwt = get_entra_agent_jwt(user_token)
 
-        # Step 2 — Call Claude via Microsoft Foundry with the WIF-derived token
-        result = call_claude(agent_auth_header, message, system)
+        # Step 2 — Anthropic WIF: exchange Entra JWT for a short-lived Claude access token
+        claude_token = exchange_entra_jwt_for_claude_token(entra_jwt)
+
+        # Step 3 — Call Claude API directly with the WIF-derived access token
+        result = call_claude(claude_token, message, system)
 
         content_blocks = result.get("content", [])
         text = content_blocks[0].get("text", "") if content_blocks else ""

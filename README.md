@@ -1,35 +1,27 @@
 # Claude WIF AgentID — Proof of Concept
 
 A **minimal runnable PoC** that uses **Microsoft Entra Agent ID** with
-**Workload Identity Federation (WIF)** to authenticate to
-**Claude via Microsoft Foundry** — _no Anthropic API key required_.
+**Workload Identity Federation (WIF)** to authenticate directly to the
+**Anthropic Claude API** — no Anthropic API key required.
 
 This project follows the **sidecar pattern** established in
 [microsoft/entra-agentid-samples](https://github.com/microsoft/entra-agentid-samples/tree/main/sidecar/aws),
-adapting it from AWS Bedrock to the direct Claude endpoint on Azure.
+combining it with [Anthropic's native WIF support](https://platform.claude.com/docs/en/build-with-claude/workload-identity-federation).
 
 ---
 
-## Can Entra Agent ID + WIF be used with the Claude API?
+## Can Entra Agent ID + WIF be used with the Anthropic Claude API?
 
-**Yes — via Microsoft Foundry.**
+**Yes — via Anthropic's Workload Identity Federation.**
 
-Anthropic Claude models (Sonnet, Haiku, Opus) are available through
-[Microsoft Foundry](https://learn.microsoft.com/en-us/azure/foundry/foundry-models/how-to/use-foundry-models-claude)
-at an endpoint such as:
+Anthropic supports passwordless authentication through
+[Workload Identity Federation](https://platform.claude.com/docs/en/build-with-claude/workload-identity-federation):
+any OIDC-capable identity provider — including **Microsoft Entra** — can issue
+a signed JWT that is exchanged at `POST https://api.anthropic.com/v1/oauth/token`
+(RFC 7523 jwt-bearer grant) for a short-lived Claude access token.
 
-```
-https://<resource>.services.ai.azure.com/anthropic/v1/messages
-```
-
-This endpoint uses **Azure AD / Entra authentication** (scope:
-`https://cognitiveservices.azure.com/.default`), meaning any service
-principal — including an **Entra Agent Identity** — can call Claude with a
-standard Bearer token obtained through Entra.
-
-> **Direct `api.anthropic.com`**: the Anthropic public API uses API keys and
-> does _not_ accept Entra tokens. For Entra WIF authentication, always use the
-> Foundry endpoint.
+This means an **Entra Agent Identity** service principal can call Claude
+directly, with zero long-lived secrets stored anywhere.
 
 ---
 
@@ -47,7 +39,7 @@ standard Bearer token obtained through Entra.
 │  │  :3000                                │                                │
 │  │                                       │                                │
 │  │  ① Receive user query                 │                                │
-│  │  ② Ask sidecar for auth header        │                                │
+│  │  ② Ask sidecar for Entra JWT          │                                │
 │  └────────────────┬──────────────────────┘                                │
 │                   │ ③ GET /AuthorizationHeader                            │
 │                   │    ?DownstreamApi=claude-api                          │
@@ -57,45 +49,50 @@ standard Bearer token obtained through Entra.
 │  │  claude-wif-sidecar                   │ ──────────────────────────▶   │
 │  │  Microsoft Entra SDK Auth Sidecar     │                   Entra ID    │
 │  │  NO host port — network-only          │ ◀──────────────────────────   │
-│  └────────────────┬──────────────────────┘  ⑤ Agent ID Bearer token     │
-│                   │ ⑥ Authorization: Bearer <Agent ID token>             │
+│  └────────────────┬──────────────────────┘  ⑤ Entra Agent ID JWT        │
+│                   │ ⑥ raw JWT (aud = Anthropic WIF audience)             │
 │                   ▼                                                       │
-│  ┌───────────────────────────────────────┐                                │
-│  │  ⑦ claude-wif-agent calls Foundry:   │                                │
-│  │     POST *.services.ai.azure.com/     │                                │
-│  │          anthropic/v1/messages        │                                │
-│  │     with WIF-derived Bearer token     │                                │
+│  ┌───────────────────────────────────────┐  ⑦ POST /v1/oauth/token      │
+│  │  claude-wif-agent exchanges JWT:      │ ──────────────────────────▶   │
+│  │  RFC 7523 jwt-bearer grant            │              api.anthropic.com │
+│  │                                       │ ◀──────────────────────────   │
+│  │  ⑧ short-lived Claude access token   │  short-lived access token     │
+│  │                                       │                                │
+│  │  ⑨ POST /v1/messages                 │ ──────────────────────────▶   │
+│  │     Authorization: Bearer <token>     │              api.anthropic.com │
 │  └───────────────────────────────────────┘                                │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Key insight
 
-Steps ④ and ⑤ — credential handling and token exchange — happen exclusively
-inside the sidecar container, on a Docker network the host cannot reach
-directly. The agent code at step ② does a plain `GET` to the sidecar; no
-MSAL, no certificates, no secrets in agent memory.
+Steps ④ and ⑤ — Entra credential handling and token exchange — happen
+exclusively inside the sidecar container. Step ⑦ is the only Anthropic-specific
+step the agent performs: exchanging the Entra JWT for a Claude token via the
+standard RFC 7523 oauth token endpoint. No MSAL, no certificates, no API keys
+in agent memory.
 
 ---
 
 ## What is Workload Identity Federation (WIF)?
 
-WIF eliminates long-lived secrets from workload runtimes:
+### Entra side (sidecar)
+The sidecar authenticates the Blueprint app registration to Entra using either a
+client secret (local dev) or a Managed Identity OIDC assertion (Azure/production).
+It then mints an **Entra Agent Identity JWT** scoped to the audience you configured
+in the Anthropic Console federation issuer.
+
+### Anthropic side (agent)
+The agent exchanges that Entra JWT at `POST /v1/oauth/token` using the
+`urn:ietf:params:oauth:grant-type:jwt-bearer` grant type. Anthropic validates the
+JWT against the federation rules you defined in the Anthropic Console and returns
+a short-lived Claude access token. No Anthropic API key is ever used or stored.
 
 | Local dev | Azure / WIF production |
 |-----------|------------------------|
 | Sidecar uses `ClientSecret` from env | Sidecar uses `SignedAssertionFromManagedIdentity` |
-| Blueprint secret stored in `.env` | Managed Identity OIDC assertion is sent to Entra as `client_assertion` (RFC 7523) |
-| One env-var change, **no code change** | No secret ever stored — true WIF |
-
-The FIC (Federated Identity Credential) on the Blueprint app registration
-tells Entra: _"trust assertions signed by this OIDC issuer for this subject"_.
-At runtime the sidecar requests the MI OIDC token from Azure IMDS, sends it
-as `client_assertion`, and Entra issues a Blueprint token. The Blueprint then
-mints an Agent Identity token for the downstream API (Foundry/Claude).
-
-For local dev, `ClientSecret` is a functional equivalent — same API surface,
-same agent code, swap one environment variable.
+| Secret stored in `.env` | Managed Identity OIDC assertion is the `client_assertion` (RFC 7523) |
+| One env-var change, **no code change** | No secret ever stored — true WIF end-to-end |
 
 ---
 
@@ -104,14 +101,13 @@ same agent code, swap one environment variable.
 | Requirement | Notes |
 |-------------|-------|
 | Docker + Docker Compose v2 | Any platform |
-| Azure subscription | For the Foundry resource and Entra tenant |
-| **Microsoft Foundry resource** | With a Claude model deployed (e.g. `claude-3-5-sonnet-20241022`) |
+| Azure subscription | For the Entra tenant |
 | PowerShell 7+ | For the provisioning script |
-| Azure CLI + `az login` | Used by the provisioning script for RBAC assignment |
+| **Anthropic Console access** | To create a service account and configure WIF |
 
 ---
 
-## Quick start
+## Setup
 
 ### 1. Provision Entra objects
 
@@ -121,33 +117,42 @@ git clone https://github.com/astaykov/claude-wif-agentid.git
 cd claude-wif-agentid
 
 # Run the provisioning script (local dev — client secret)
-./scripts/Provision-EntraObjects.ps1 `
-    -TenantId         "<your-tenant-id>" `
-    -FoundryResourceId "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.CognitiveServices/accounts/<foundry-name>"
+./scripts/Provision-EntraObjects.ps1 -TenantId "<your-tenant-id>"
 ```
 
 The script creates:
 - **Blueprint app registration** with a client secret
 - **Agent Identity** service principal, linked to the Blueprint via a FIC
-- **Cognitive Services User** RBAC role assignment on the Foundry resource
 
-It prints the values to paste into `.env`.
+It prints the values to paste into `.env` **and** the exact issuer/audience to
+enter in the Anthropic Console.
 
-### 2. Configure environment
+### 2. Configure Anthropic Console
+
+In the [Anthropic Console](https://console.anthropic.com/) → Settings:
+
+1. **Create a Service Account** — note the `svac_...` ID.
+2. **Create a Federation Issuer**:
+   - Issuer URL: `https://login.microsoftonline.com/<tenant-id>/v2.0`
+   - Audience: `api://<blueprint-app-id>` ← printed by the provisioning script
+3. **Create a Federation Rule** linking the issuer to the service account.
+   Match on the `appid` claim equal to your Agent Identity Client ID.
+
+### 3. Configure environment
 
 ```bash
 cp .env.example .env
-# Edit .env and fill in all values printed by the script above,
-# plus your Foundry endpoint URL.
+# Edit .env and fill in all values printed by the provisioning script,
+# plus your ANTHROPIC_SERVICE_ACCOUNT_ID from the Anthropic Console.
 ```
 
-### 3. Run
+### 4. Run
 
 ```bash
 docker compose --env-file .env up --build
 ```
 
-### 4. Test
+### 5. Test
 
 ```bash
 # Autonomous (app-only) flow — Agent Identity acts independently
@@ -176,7 +181,7 @@ Expected response:
 
 When a signed-in user's Entra Bearer token is available, pass it in the
 `Authorization` header. The sidecar performs the OBO exchange and mints an
-agent-on-behalf-of-user token:
+agent-on-behalf-of-user token, which is then exchanged with Anthropic WIF:
 
 ```bash
 curl -s -X POST http://localhost:3000/chat \
@@ -205,8 +210,7 @@ Also add a FIC on the Blueprint app registration:
 ```powershell
 # PowerShell — after provisioning, add WIF FIC for your MI
 ./scripts/Provision-EntraObjects.ps1 `
-    -TenantId         "<your-tenant-id>" `
-    -FoundryResourceId "…" `
+    -TenantId  "<your-tenant-id>" `
     -UseWIF `
     -WIFIssuer "https://token.actions.githubusercontent.com" `
     -WIFSubject "repo:myorg/myrepo:ref:refs/heads/main"
@@ -228,20 +232,24 @@ Also add a FIC on the Blueprint app registration:
         │
         │ Agent Identity FIC exchange
         ▼
-[Agent Identity token (TR)]
-  scope: https://cognitiveservices.azure.com/.default
-  aud:   your Foundry resource
-  xms_par_app_azp: Agent Identity App ID  ← auditable in Entra logs
+[Entra Agent Identity JWT]
+  aud:  api://<Blueprint AppId>  ← matches Anthropic federation issuer audience
+  iss:  https://login.microsoftonline.com/<tenantId>/v2.0
+  appid: Agent Identity App ID   ← matched by Anthropic federation rule
         │
-        │ Bearer TR in Authorization header
+        │ RFC 7523 jwt-bearer exchange
+        │ POST api.anthropic.com/v1/oauth/token
+        │   grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer
+        │   assertion=<Entra JWT>
+        │   client_id=<Anthropic service account svac_...>
         ▼
-[Claude via Microsoft Foundry]
-  https://<resource>.services.ai.azure.com/anthropic/v1/messages
+[Short-lived Claude access token]
+        │
+        │ Authorization: Bearer <claude_token>
+        ▼
+[Claude API]
+  https://api.anthropic.com/v1/messages
 ```
-
-The `xms_par_app_azp` claim in the Agent Identity token tells the Foundry
-endpoint _which specific agent_ made the call — enabling per-agent auditing
-and Conditional Access policy.
 
 ---
 
@@ -251,42 +259,19 @@ and Conditional Access policy.
 |--------|-----|---------------|-------------|
 | [`sidecar/dev`](https://github.com/microsoft/entra-agentid-samples/tree/main/sidecar/dev) | Ollama (local) | Client secret / MI | — |
 | [`sidecar/aws`](https://github.com/microsoft/entra-agentid-samples/tree/main/sidecar/aws) | AWS Bedrock (Claude) | Client secret / MI | — |
-| **This PoC** | **Claude via Microsoft Foundry** | **Client secret / WIF** | ✓ |
+| **This PoC** | **Claude API (direct)** | **Client secret / WIF** | ✓ |
 
-The key difference: instead of calling Claude via AWS Bedrock (with separate
-AWS credentials), this PoC calls Claude via the **Azure-native Foundry
-endpoint using the Entra Agent ID token directly**. No AWS credentials, no
-Anthropic API key — just the WIF-derived Entra Bearer token.
-
----
-
-## n8n workflow equivalent
-
-The three n8n workflows from
-[microsoft/entra-agentid-samples/n8n](https://github.com/microsoft/entra-agentid-samples/tree/main/n8n)
-(using the [`@astaykov/n8n-nodes-entraagentid`](https://www.npmjs.com/package/@astaykov/n8n-nodes-entraagentid)
-community node) can be adapted to call Claude via Foundry:
-
-1. **Autonomous workflow**: use the `EntraAgentID` node to acquire an Azure
-   Cognitive Services token, then an HTTP Request node to POST to
-   `https://<resource>.services.ai.azure.com/anthropic/v1/messages`.
-
-2. **OBO webhook workflow**: receive a user Entra token via webhook, pass it
-   to the `EntraAgentID` node for OBO exchange, then call Claude with the
-   resulting agent token.
-
-3. **Autonomous + Graph MCP**: same as (1) but also call Microsoft Graph via
-   a second `EntraAgentID` token acquisition before or after the Claude call.
-
-Deploying the full n8n stack on Azure Container Apps is covered in
-[astaykov/n8n-aca](https://github.com/astaykov/n8n-aca).
+The key difference: instead of routing Claude through a cloud provider's gateway
+(Foundry or Bedrock), this PoC uses **Anthropic's native WIF** to exchange an
+Entra JWT directly for a Claude access token — no cloud LLM proxy, no
+provider-specific credentials.
 
 ---
 
 ## Learn more
 
+- [Anthropic Workload Identity Federation](https://platform.claude.com/docs/en/build-with-claude/workload-identity-federation)
 - [Microsoft Entra Agent ID overview](https://learn.microsoft.com/en-us/entra/agent-id/)
 - [Microsoft Entra SDK Auth Sidecar](https://mcr.microsoft.com/en-us/product/entra-sdk/auth-sidecar/about)
-- [Deploy Claude models in Microsoft Foundry](https://learn.microsoft.com/en-us/azure/foundry/foundry-models/how-to/use-foundry-models-claude)
-- [Workload Identity Federation](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation)
+- [Workload Identity Federation (Entra)](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation)
 - [entra-agentid-samples](https://github.com/microsoft/entra-agentid-samples)

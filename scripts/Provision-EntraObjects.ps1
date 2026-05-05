@@ -5,18 +5,17 @@
 .DESCRIPTION
     Creates:
       1. Agent Identity Blueprint app registration (with client secret or WIF FIC)
-      2. Agent Identity service principal
-      3. Assigns "Cognitive Services User" Azure RBAC role to the Agent Identity
-         on the Microsoft Foundry resource, so it can call Claude via Foundry.
+      2. Agent Identity service principal, linked to the Blueprint via a FIC
+
+    Note: No Azure RBAC assignment is needed — the agent authenticates to
+    api.anthropic.com via Anthropic Workload Identity Federation, not Microsoft Foundry.
+    You must configure the matching federation issuer and rule in the Anthropic Console
+    (see README for instructions).
 
     Outputs the values needed in .env (or sidecar env vars for Azure deployment).
 
 .PARAMETER TenantId
     Your Entra tenant ID.
-
-.PARAMETER FoundryResourceId
-    Full Azure resource ID of your Microsoft Foundry resource.
-    Example: /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.CognitiveServices/accounts/<name>
 
 .PARAMETER BlueprintDisplayName
     Display name for the Blueprint app registration (default: "Claude-WIF-Blueprint").
@@ -37,12 +36,10 @@
 
 .EXAMPLE
     # Local dev: client secret
-    ./Provision-EntraObjects.ps1 -TenantId "…" `
-        -FoundryResourceId "/subscriptions/…/…/accounts/my-foundry"
+    ./Provision-EntraObjects.ps1 -TenantId "…"
 
     # Production: WIF with GitHub Actions OIDC
     ./Provision-EntraObjects.ps1 -TenantId "…" `
-        -FoundryResourceId "/subscriptions/…/…/accounts/my-foundry" `
         -UseWIF `
         -WIFIssuer "https://token.actions.githubusercontent.com" `
         -WIFSubject "repo:myorg/myrepo:ref:refs/heads/main"
@@ -52,9 +49,6 @@
 param(
     [Parameter(Mandatory)]
     [string] $TenantId,
-
-    [Parameter(Mandatory)]
-    [string] $FoundryResourceId,
 
     [string] $BlueprintDisplayName = "Claude-WIF-Blueprint",
     [string] $AgentDisplayName     = "Claude-WIF-Agent",
@@ -68,7 +62,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # ── Prerequisites ────────────────────────────────────────────────────────────
-$requiredModules = @("Microsoft.Entra", "Microsoft.Entra.Beta", "Az.Accounts", "Az.Authorization")
+$requiredModules = @("Microsoft.Entra", "Microsoft.Entra.Beta")
 foreach ($mod in $requiredModules) {
     if (-not (Get-Module -ListAvailable -Name $mod)) {
         Write-Host "Installing $mod …" -ForegroundColor Cyan
@@ -85,11 +79,8 @@ Connect-Entra -TenantId $TenantId -Scopes `
     "AgentIdentityBlueprint.ReadWrite.All",
     "AgentIdentityBlueprintPrincipal.ReadWrite.All"
 
-Write-Host "`n=== Connecting to Azure ===" -ForegroundColor Cyan
-Connect-AzAccount -TenantId $TenantId
-
 # ── 1. Blueprint App Registration ────────────────────────────────────────────
-Write-Host "`n[1/4] Creating Blueprint app registration: $BlueprintDisplayName" -ForegroundColor Cyan
+Write-Host "`n[1/3] Creating Blueprint app registration: $BlueprintDisplayName" -ForegroundColor Cyan
 
 $blueprint = New-EntraApplication -DisplayName $BlueprintDisplayName
 $blueprintSp = New-EntraServicePrincipal -AppId $blueprint.AppId
@@ -103,7 +94,7 @@ if ($UseWIF) {
     if (-not $WIFIssuer -or -not $WIFSubject) {
         throw "Both -WIFIssuer and -WIFSubject are required when -UseWIF is set."
     }
-    Write-Host "`n[2/4] Adding Federated Identity Credential (WIF) to Blueprint" -ForegroundColor Cyan
+    Write-Host "`n[2/3] Adding Federated Identity Credential (WIF) to Blueprint" -ForegroundColor Cyan
     $fic = @{
         Name        = "wif-credential"
         Issuer      = $WIFIssuer
@@ -114,7 +105,7 @@ if ($UseWIF) {
     New-EntraApplicationFederatedIdentityCredential -ApplicationId $blueprint.Id @fic | Out-Null
     Write-Host "      FIC configured: issuer=$WIFIssuer  subject=$WIFSubject"
 } else {
-    Write-Host "`n[2/4] Adding client secret to Blueprint (local dev)" -ForegroundColor Cyan
+    Write-Host "`n[2/3] Adding client secret to Blueprint (local dev)" -ForegroundColor Cyan
     $secretResult = Add-EntraApplicationPassword -ApplicationId $blueprint.Id `
         -PasswordCredential @{ DisplayName = "dev-secret" }
     $secretText = $secretResult.SecretText
@@ -122,7 +113,7 @@ if ($UseWIF) {
 }
 
 # ── 3. Agent Identity ────────────────────────────────────────────────────────
-Write-Host "`n[3/4] Creating Agent Identity: $AgentDisplayName" -ForegroundColor Cyan
+Write-Host "`n[3/3] Creating Agent Identity: $AgentDisplayName" -ForegroundColor Cyan
 
 # Use the Beta cmdlet for Agent Identity (Entra Agent ID preview feature)
 $agentApp = New-EntraBetaApplication -DisplayName $AgentDisplayName
@@ -144,20 +135,6 @@ $agentFic = @{
 New-EntraBetaApplicationFederatedIdentityCredential -ApplicationId $agentApp.Id @agentFic | Out-Null
 Write-Host "      Agent FIC linked to Blueprint"
 
-# ── 4. Azure RBAC: Cognitive Services User on Foundry resource ───────────────
-Write-Host "`n[4/4] Assigning 'Cognitive Services User' RBAC role to Agent Identity" -ForegroundColor Cyan
-Write-Host "      Resource: $FoundryResourceId"
-
-# Role definition ID for "Cognitive Services User"
-$cogServicesUserRoleId = "a97b65f3-24c7-4388-baec-2e87135dc908"
-
-New-AzRoleAssignment `
-    -ObjectId           $agentSp.Id `
-    -RoleDefinitionId   $cogServicesUserRoleId `
-    -Scope              $FoundryResourceId | Out-Null
-
-Write-Host "      Role assignment created"
-
 # ── Summary ──────────────────────────────────────────────────────────────────
 Write-Host "`n=== Provisioning complete ===" -ForegroundColor Green
 Write-Host ""
@@ -172,6 +149,17 @@ if ($secretText) {
     Write-Host "# AzureAd__ClientCredentials__0__SourceType=SignedAssertionFromManagedIdentity"
 }
 Write-Host "AGENT_CLIENT_ID=$($agentApp.AppId)"
+Write-Host "ENTRA_WIF_SCOPE=api://$($blueprint.AppId)/.default"
+Write-Host ""
+Write-Host "Next steps — Anthropic Console:" -ForegroundColor Yellow
+Write-Host "  1. Create a Service Account in the Anthropic Console."
+Write-Host "     Set ANTHROPIC_SERVICE_ACCOUNT_ID=<svac_...> in your .env."
+Write-Host "  2. Create a Federation Issuer:"
+Write-Host "     Issuer URL : https://login.microsoftonline.com/$TenantId/v2.0"
+Write-Host "     Audience   : api://$($blueprint.AppId)"
+Write-Host "  3. Create a Federation Rule mapping the Agent Identity's token claims"
+Write-Host "     (e.g. appid=$($agentApp.AppId)) to your service account."
+Write-Host "  4. See README for full instructions."
 Write-Host ""
 
 if ($UseWIF) {
