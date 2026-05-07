@@ -32,18 +32,18 @@ directly, with zero long-lived secrets stored anywhere.
 │                        claude-wif-network (Docker bridge)                 │
 │                                                                           │
 │  You (curl / browser)                                                     │
-│   http://localhost:3000  ────────────────────────────────┐                │
+│   http://localhost:4192  ────────────────────────────────┐                │
 │                                                           ▼               │
 │  ┌───────────────────────────────────────┐                                │
 │  │  claude-wif-agent  (Flask)            │                                │
-│  │  :3000                                │                                │
+│  │  :3000 (host: 4192)                   │                                │
 │  │                                       │                                │
 │  │  ① Receive user query                 │                                │
 │  │  ② Ask sidecar for Entra JWT          │                                │
 │  └────────────────┬──────────────────────┘                                │
-│                   │ ③ GET /AuthorizationHeader                            │
-│                   │    ?DownstreamApi=claude-api                          │
-│                   │    &AgentIdentity=<agentId>                           │
+│                   │ ③ GET /AuthorizationHeaderUnauthenticated/claude-api  │
+│                   │    ?AgentIdentity=<agentId>                           │
+│                   │    Host: localhost                                     │
 │                   ▼                                                       │
 │  ┌───────────────────────────────────────┐  ④ WIF / client-creds         │
 │  │  claude-wif-sidecar                   │ ──────────────────────────▶   │
@@ -189,7 +189,7 @@ When a signed-in user's Entra Bearer token is available, pass it in the
 agent-on-behalf-of-user token, which is then exchanged with Anthropic WIF:
 
 ```bash
-curl -s -X POST http://localhost:3000/chat \
+curl -s -X POST http://localhost:4192/chat \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <entra-user-token>" \
   -d '{"message": "Summarise my recent emails."}' | jq .
