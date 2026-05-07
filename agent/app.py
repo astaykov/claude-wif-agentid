@@ -79,26 +79,21 @@ def get_entra_agent_jwt(user_token: str | None = None) -> str:
     if user_token:
         headers["Authorization"] = f"Bearer {user_token}"
 
+    headers["Host"] = "localhost"
+
     log.info("[WIF] Requesting Entra Agent ID JWT from sidecar (flow=%s)",
              "obo" if user_token else "autonomous")
 
     resp = requests.get(
-        f"{SIDECAR_URL}/AuthorizationHeader",
-        params=params,
+        f"{SIDECAR_URL}/AuthorizationHeaderUnauthenticated/{DOWNSTREAM_API_NAME}?AgentIdentity={AGENT_APP_ID}",
         headers=headers,
         timeout=15,
     )
     resp.raise_for_status()
 
-    auth_header = resp.text.strip()
-    # Log only the token type prefix for debugging, never the full token
-    log.info("[WIF] Entra JWT received: %s...", auth_header[:20])
-
-    # Strip "Bearer " prefix — the raw JWT is what Anthropic WIF expects
-    if auth_header.startswith("Bearer "):
-        return auth_header[len("Bearer "):]
-    return auth_header
-
+    auth_header = resp.json()["authorizationHeader"]
+    log.info("[WIF] Entra JWT received: %s...", auth_header[:80])
+    return auth_header.removeprefix("Bearer ")
 
 # ---------------------------------------------------------------------------
 # Anthropic Workload Identity Federation — token exchange

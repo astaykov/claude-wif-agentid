@@ -62,7 +62,7 @@ services:
     build: ./agent
     container_name: claude-wif-agent
     ports:
-      - "3000:3000"
+      - "4192:3000"
     environment:
       - SIDECAR_URL=http://sidecar:5000
       - AGENT_APP_ID=${AGENT_CLIENT_ID}

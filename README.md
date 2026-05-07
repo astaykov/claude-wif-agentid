@@ -159,12 +159,14 @@ docker compose --env-file .env up --build
 
 ```bash
 # Autonomous (app-only) flow — Agent Identity acts independently
-curl -s -X POST http://localhost:3000/chat \
+curl -s -X POST http://localhost:4192/chat \
   -H "Content-Type: application/json" \
   -d '{"message": "Explain Workload Identity Federation in one paragraph."}' | jq .
 
+curl -s -X POST http://localhost:4192/chat -H "Content-Type: application/json" -d '{"message": "Explain Workload Identity Federation in one paragraph."}'
+
 # Health check
-curl http://localhost:3000/health
+curl http://localhost:4192/health
 ```
 
 Expected response:
