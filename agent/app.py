@@ -71,10 +71,6 @@ def get_entra_agent_jwt(user_token: str | None = None) -> str:
     Returns the raw JWT string (without the "Bearer " prefix) for use in the
     Anthropic RFC 7523 token exchange.
     """
-    params = {
-        "DownstreamApi": DOWNSTREAM_API_NAME,
-        "AgentIdentity": AGENT_APP_ID,
-    }
     headers = {}
     if user_token:
         headers["Authorization"] = f"Bearer {user_token}"

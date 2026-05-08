@@ -27,14 +27,14 @@ This means an AI Agent using **Entra Agent Identity** can call Claude APIs utili
 │                                                           ▼               │
 │  ┌───────────────────────────────────────┐                                │
 │  │  claude-wif-agent  (Flask)            │                                │
-│  │  :4192                                │                                │
+│  │  :3000 (host: 4192)                   │                                │
 │  │                                       │                                │
 │  │  (1) Receive user query               │                                │
 │  │  (2) Ask sidecar for Entra JWT        │                                │
 │  └────────────────┬──────────────────────┘                                │
-│                   │ (3) GET /AuthorizationHeaderUnauthenticated           │
-│                   │    ?DownstreamApi=claude-api                          │
-│                   │    &AgentIdentity=<agentId>                           │
+│                   │ ③ GET /AuthorizationHeaderUnauthenticated/claude-api  │
+│                   │    ?AgentIdentity=<agentId>                           │
+│                   │    Host: localhost                                     │
 │                   ▼                                                       │
 │  ┌───────────────────────────────────────┐  (4) client-creds              │
 │  │  claude-wif-sidecar                   │ ──────────────────────────▶   │
@@ -249,6 +249,99 @@ Expected response:
   "usage": { "input_tokens": 18, "output_tokens": 120 }
 }
 ```
+
+---
+
+## OBO (On-Behalf-Of) flow
+
+When a signed-in user's Entra Bearer token is available, pass it in the
+`Authorization` header. The sidecar performs the OBO exchange and mints an
+agent-on-behalf-of-user token, which is then exchanged with Anthropic WIF:
+
+```bash
+curl -s -X POST http://localhost:4192/chat \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <entra-user-token>" \
+  -d '{"message": "Summarise my recent emails."}' | jq .
+```
+
+The response will show `"flow": "obo"`.
+
+---
+
+## Switching to true WIF (Azure deployment)
+
+Change **two environment variables** in `docker-compose.yml` (or your
+Container Apps/Kubernetes deployment manifest) — no agent code changes:
+
+```yaml
+# docker-compose.yml — sidecar service
+- AzureAd__ClientCredentials__0__SourceType=SignedAssertionFromManagedIdentity
+- AzureAd__ClientCredentials__0__ManagedIdentityResourceId=/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<mi-name>
+```
+
+Also add a FIC on the Blueprint app registration:
+
+```powershell
+# PowerShell — after provisioning, add WIF FIC for your MI
+./scripts/Provision-EntraObjects.ps1 `
+    -TenantId  "<your-tenant-id>" `
+    -UseWIF `
+    -WIFIssuer "https://token.actions.githubusercontent.com" `
+    -WIFSubject "repo:myorg/myrepo:ref:refs/heads/main"
+```
+
+---
+
+## Token flow (detailed)
+
+```
+[Workload runtime]
+  MI / K8s SA / GitHub OIDC token
+        │
+        │ WIF exchange (sidecar → Entra)
+        ▼
+[Blueprint token (T1)]
+  scope: api://<Blueprint AppId>
+  used by sidecar only
+        │
+        │ Agent Identity FIC exchange
+        ▼
+[Entra Agent Identity JWT]
+  aud:  api://<Blueprint AppId>  ← matches Anthropic federation issuer audience
+  iss:  https://login.microsoftonline.com/<tenantId>/v2.0
+  appid: Agent Identity App ID   ← matched by Anthropic federation rule
+        │
+        │ RFC 7523 jwt-bearer exchange
+        │ POST api.anthropic.com/v1/oauth/token
+        │   grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer
+        │   assertion=<Entra JWT>
+        │   federation_rule_id=fdrl_...
+        │   organization_id=<Anthropic org UUID>
+        │   service_account_id=svac_...
+        ▼
+[Short-lived Claude access token]
+        │
+        │ Authorization: Bearer <claude_token>
+        ▼
+[Claude API]
+  https://api.anthropic.com/v1/messages
+```
+
+---
+
+## Relation to existing entra-agentid-samples
+
+| Sample | LLM | Identity flow | This project |
+|--------|-----|---------------|-------------|
+| [`sidecar/dev`](https://github.com/microsoft/entra-agentid-samples/tree/main/sidecar/dev) | Ollama (local) | Client secret / MI | — |
+| [`sidecar/aws`](https://github.com/microsoft/entra-agentid-samples/tree/main/sidecar/aws) | AWS Bedrock (Claude) | Client secret / MI | — |
+| **This PoC** | **Claude API (direct)** | **Client secret / WIF** | ✓ |
+
+The key difference: instead of routing Claude through a cloud provider's gateway
+(Foundry or Bedrock), this PoC uses **Anthropic's native WIF** to exchange an
+Entra JWT directly for a Claude access token — no cloud LLM proxy, no
+provider-specific credentials.
 
 ---
 
