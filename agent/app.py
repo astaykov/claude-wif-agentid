@@ -33,7 +33,7 @@ import logging
 import os
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -143,10 +143,19 @@ def exchange_entra_jwt_for_claude_token(entra_jwt: str) -> str:
 # Claude API
 # ---------------------------------------------------------------------------
 
-def call_claude(claude_access_token: str, message: str, system: str | None = None) -> dict:
+def call_claude(
+    claude_access_token: str,
+    message: str | None = None,
+    system: str | None = None,
+    messages: list[dict] | None = None,
+) -> dict:
     """
     Call the Anthropic Claude API using the short-lived access token obtained
     from the Anthropic WIF token exchange.  No Anthropic API key is used.
+
+    If *messages* (a list of {role, content} dicts) is provided it is sent
+    directly — this enables multi-turn conversations.  Otherwise a single
+    user message is constructed from *message* (backward compatible).
     """
     messages_url = f"{ANTHROPIC_API_BASE}/v1/messages"
     headers = {
@@ -158,7 +167,7 @@ def call_claude(claude_access_token: str, message: str, system: str | None = Non
     payload: dict = {
         "model": CLAUDE_MODEL,
         "max_tokens": 1024,
-        "messages": [{"role": "user", "content": message}],
+        "messages": messages if messages else [{"role": "user", "content": message}],
     }
     if system:
         payload["system"] = system
@@ -172,6 +181,12 @@ def call_claude(claude_access_token: str, message: str, system: str | None = Non
 # ---------------------------------------------------------------------------
 # Flask routes
 # ---------------------------------------------------------------------------
+
+@app.route("/")
+def index():
+    """Serve the SPA."""
+    return send_from_directory("static", "index.html")
+
 
 @app.route("/health")
 def health():
@@ -189,9 +204,10 @@ def chat():
     Returns: { "response": "...", "model": "...", "flow": "autonomous|obo" }
     """
     data = request.get_json(force=True, silent=True) or {}
+    messages = data.get("messages")  # multi-turn: [{role, content}, ...]
     message = (data.get("message") or "").strip()
-    if not message:
-        return jsonify({"error": "message is required"}), 400
+    if not messages and not message:
+        return jsonify({"error": "message or messages is required"}), 400
 
     system = data.get("system")
 
@@ -211,7 +227,7 @@ def chat():
         claude_token = exchange_entra_jwt_for_claude_token(entra_jwt)
 
         # Step 3 — Call Claude API directly with the WIF-derived access token
-        result = call_claude(claude_token, message, system)
+        result = call_claude(claude_token, message=message, system=system, messages=messages)
 
         content_blocks = result.get("content", [])
         text = content_blocks[0].get("text", "") if content_blocks else ""
