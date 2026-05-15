@@ -101,7 +101,7 @@ A first-class object in the Microsoft Entra Agent ID platform — **not** a regu
 Reference: [Agent identity blueprints](https://learn.microsoft.com/en-us/entra/agent-id/agent-blueprint),
 [Blueprint principals](https://learn.microsoft.com/en-us/entra/agent-id/agent-blueprint#agent-identity-blueprint-principals).
 
-You will need the `client_id` and `client_secret` for the blueprint you created.
+For this sample, you will need the `client_id` and `client_secret` for the blueprint you created.
 
 ### 2. Entra Agent Identity (parented by the Blueprint)
 
@@ -121,7 +121,7 @@ This app registration:
 - Uses `requestedAccessTokenVersion: 2` — the app **must** request v2.0 tokens for the optional claims to work.
 - Has `acceptMappedClaims: true` so the optional claims below are emitted.
 - Does **not** need to expose OAuth2 permission scopes, because there will be no human impersonation (`oauth2PermissionScopes` can be empty). The sidecar requests the
-  `/.default` scope of this app's identifier URI   (e.g. `api://anthropic.ai.dayzure.com/.default`) which is set as   `ENTRA_WIF_SCOPE`.
+  `/.default` scope of this app's identifier URI   (e.g. `api://anthropic.ai.dayzure.com/.default`) which is set as `ENTRA_WIF_SCOPE`.
 - Does **not* require any API Permissions, because it does not authenticate users. You may remove any default API Permissions requests, such as `User.Read`.
 - **Requires specific Optional Claims** on the **access token**. These Microsoft-extended (`xms_*`) claims provide the token-provenance metadata that Anthropic's federation rule needs to match the incoming JWT:
 
@@ -201,16 +201,20 @@ That token is what Anthropic's WIF endpoint validates against your federation is
 
 In the [Anthropic Console](https://console.anthropic.com/) → Settings:
 
-1. **Create a Service Account** — note the `svac_...` ID → `ANTHROPIC_SERVICE_ACCOUNT_ID`.
-2. **Note your Organization ID** (UUID on the Organization settings page) → `ANTHROPIC_ORGANIZATION_ID`.
-3. **Create a Federation Issuer**:
-   - Issuer URL: `https://login.microsoftonline.com/<tenant-id>/v2.0`
-   - Audience: `api://<anthropic-api-app-identifier-uri>` ← the Application
-     ID URI of the **Anthropic API app registration** (object 3), **not** the
-     blueprint's app ID. Printed by the provisioning script.
-4. **Create a Federation Rule** linking the issuer to the service account.
-   Match on the `appid` claim equal to your Agent Identity Client ID.
-   Note the `fdrl_...` rule ID → `ANTHROPIC_FEDERATION_RULE_ID`.
+1. **Create a Service Account**: Navigate to [Service Accounts](https://platform.claude.com/settings/service-accounts) and click `+ Create service account`, note the `svac_...` ID → `ANTHROPIC_SERVICE_ACCOUNT_ID`.
+2. **Note your Organization ID**: (UUID on the Organization settings page) → `ANTHROPIC_ORGANIZATION_ID`.
+3. **Create a Federation Issuer**: Navigate to [Workload Identity Federation](https://platform.claude.com/settings/workload-identity-federation) and click `+ Register issuer` and enter your Entra ID issuer URL: `https://login.microsoftonline.com/<your-tenant-id>/v2.0`
+4. **Create new federation rule** Navigate to [Rules](https://platform.claude.com/settings/workload-identity-federation?tab=rules) and click `+ New rule` and enter the following values:
+ * `Rule name` - choose appropriate name for the rule
+ * `Description` - Entra Agent ID federation demo
+ * `Issuer` - from the drop down, select the Entra ID issuer you just created
+ * `Match configuration` - choose `Pattern match`
+ * `Subject pattern` - enter `*` - to match all subjects. This is important as we are creating rule to match by Agent Identity Blueprint, not individual agent identity
+ * `Expected audience (optional)` - enter the **Application (client) id** of the app registration you created in **Step 3** of [Required Entra objects (read this first)](#required-entra-objects-read-this-first)
+ * `Additional claim conditions (optional)` - enter the following values to match the Agent Identity Blueprint:
+   * `Claim key` - enter `xms_par_app_azp` 
+   * `Expected value` - enter the **Agent Identity Blueprint App Id**
+ Note the `fdrl_...` rule ID → `ANTHROPIC_FEDERATION_RULE_ID`.
 
 ### 3. Configure environment
 
