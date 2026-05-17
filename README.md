@@ -203,7 +203,13 @@ In the [Anthropic Console](https://console.anthropic.com/) → Settings:
 
 1. **Create a Service Account**: Navigate to [Service Accounts](https://platform.claude.com/settings/service-accounts) and click `+ Create service account`, note the `svac_...` ID → `ANTHROPIC_SERVICE_ACCOUNT_ID`.
 2. **Note your Organization ID**: (UUID on the Organization settings page) → `ANTHROPIC_ORGANIZATION_ID`.
-3. **Create a Federation Issuer**: Navigate to [Workload Identity Federation](https://platform.claude.com/settings/workload-identity-federation) and click `+ Register issuer` and enter your Entra ID issuer URL: `https://login.microsoftonline.com/<your-tenant-id>/v2.0`
+3. **Create a Federation Issuer**: Navigate to [Workload Identity Federation](https://platform.claude.com/settings/workload-identity-federation) and click `+ Register issuer`:
+ * `Name` - enter a name that will help you recognize the Entra ID tenant you are configuring for trust.
+ * `Issuer URL (iss claim)` - enter the Entra ID issuer URL. It must be in the form of  `https://login.microsoftonline.com/<your-tenant-id>/v2.0` - replace `<your-tenant-id>` with actual id (the GUID) of your Entra ID tenant
+ * `Discovery base URL` - leave as is (Same as issuer URL)
+ * `CA certificate (PEM)`  - leave as is (none)
+ * `JTI replay protection` - leave as is (Enabled)
+ * `Max token lifetime` - **adjust to 2 hours**! This is very important. Microsoft Entra ID issues access tokens with random lifetime between 60 and 90 minutes by default ([access token lifetime](https://learn.microsoft.com/en-us/entra/identity-platform/access-tokens#token-lifetime)). If you do not adjust this setting, anthorpic will reject Entra ID tokens because they have longer than 1 hour lifetime.
 4. **Create new federation rule** Navigate to [Rules](https://platform.claude.com/settings/workload-identity-federation?tab=rules) and click `+ New rule` and enter the following values:
  * `Rule name` - choose appropriate name for the rule
  * `Description` - Entra Agent ID federation demo
@@ -230,6 +236,10 @@ docker compose --env-file .env up --build
 ```
 
 ### 5. Test
+
+Open your browser and navigate to [http://localhost:4192/](http://localhost:4192/) - this is a sample chat interface that will interact with Claude AI APIs using Workload Identity Federation.
+
+Alternatively you can use `curl` from the command line to validate this scenario.
 
 ```bash
 # Autonomous (app-only) flow — Agent Identity acts independently
