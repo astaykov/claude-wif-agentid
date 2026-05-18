@@ -1,7 +1,8 @@
 """
 Claude API — Entra Agent ID WIF Proof of Concept
 =================================================
-This agent demonstrates the sidecar pattern for Workload Identity Federation:
+This agent demonstrates the sidecar pattern for Workload Identity Federation
+using the native Anthropic Python SDK with built-in WIF support:
 
   Workload runtime (Azure MI / K8s SA / GitHub OIDC)
         │  OIDC assertion (WIF)
@@ -10,11 +11,11 @@ This agent demonstrates the sidecar pattern for Workload Identity Federation:
         │                                                                 (login.microsoft.com)
         │  Entra Agent Identity JWT (scoped to Anthropic WIF audience)
         ▼
-  This agent  ──── POST /v1/oauth/token (RFC 7523 jwt-bearer) ───▶  Anthropic WIF
-        │                                                            (api.anthropic.com)
-        │  Short-lived Claude access token
+  Anthropic SDK  ──── POST /v1/oauth/token (RFC 7523 jwt-bearer) ───▶  Anthropic WIF
+        │              (handled internally by the SDK)                  (api.anthropic.com)
+        │  Short-lived Claude access token (cached + auto-refreshed)
         ▼
-  This agent  ──── POST /v1/messages (Bearer <claude_token>) ───▶  Claude API
+  Anthropic SDK  ──── POST /v1/messages (Bearer <claude_token>) ───▶  Claude API
         │
         │  Claude response
         ▼
@@ -22,17 +23,15 @@ This agent demonstrates the sidecar pattern for Workload Identity Federation:
 
 The agent code never handles Entra credentials, secrets, or token exchange logic.
 All Entra identity work is delegated to the Microsoft Entra SDK auth sidecar.
-The only logic here is the RFC 7523 exchange of the Entra JWT for a Claude token.
-
-Supported flows:
-  - Autonomous (app-only):  no user token required
-  - OBO (on-behalf-of):     pass an Entra user Bearer token in the Authorization header
+The Anthropic SDK handles the RFC 7523 exchange, token caching, and auto-refresh.
 """
 
 import logging
 import os
 
+import anthropic
 import requests
+from anthropic import WorkloadIdentityCredentials
 from flask import Flask, jsonify, request, send_from_directory
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -50,39 +49,30 @@ ANTHROPIC_API_BASE = os.environ.get("ANTHROPIC_API_BASE", "https://api.anthropic
 ANTHROPIC_SERVICE_ACCOUNT_ID = os.environ.get("ANTHROPIC_SERVICE_ACCOUNT_ID", "")
 ANTHROPIC_ORGANIZATION_ID = os.environ.get("ANTHROPIC_ORGANIZATION_ID", "")
 ANTHROPIC_FEDERATION_RULE_ID = os.environ.get("ANTHROPIC_FEDERATION_RULE_ID", "")
+ANTHROPIC_WORKSPACE_ID = os.environ.get("ANTHROPIC_WORKSPACE_ID") or None
 DOWNSTREAM_API_NAME = "claude-api"  # matches DownstreamApis__claude-api__* in sidecar config
 
 
 # ---------------------------------------------------------------------------
-# Sidecar integration
+# Sidecar integration — identity token provider for the Anthropic SDK
 # ---------------------------------------------------------------------------
 
-def get_entra_agent_jwt(user_token: str | None = None) -> str:
+def _fetch_entra_jwt() -> str:
     """
-    Ask the Entra SDK sidecar for an Entra Agent Identity JWT scoped to the
-    audience configured for Anthropic WIF (ENTRA_WIF_SCOPE in sidecar config).
+    Fetch an Entra Agent Identity JWT from the sidecar.
 
-    Autonomous flow: sidecar does client-credentials (or WIF via managed identity
-    assertion) to obtain an Agent Identity token.  No user_token needed.
+    Conforms to the Anthropic SDK's identity_token_provider interface:
+    takes no arguments and returns a raw JWT string.
 
-    OBO flow: the caller's Entra Bearer token is forwarded to the sidecar, which
-    performs the On-Behalf-Of exchange to mint an agent-on-behalf-of-user token.
-
-    Returns the raw JWT string (without the "Bearer " prefix) for use in the
-    Anthropic RFC 7523 token exchange.
+    The sidecar uses client-credentials (or WIF via managed identity assertion)
+    to obtain an Agent Identity token scoped to the Anthropic WIF audience.
     """
-    headers = {}
-    if user_token:
-        headers["Authorization"] = f"Bearer {user_token}"
-
-    headers["Host"] = "localhost"
-
-    log.info("[WIF] Requesting Entra Agent ID JWT from sidecar (flow=%s)",
-             "obo" if user_token else "autonomous")
+    log.info("[WIF] Requesting Entra Agent ID JWT from sidecar")
 
     resp = requests.get(
-        f"{SIDECAR_URL}/AuthorizationHeaderUnauthenticated/{DOWNSTREAM_API_NAME}?AgentIdentity={AGENT_APP_ID}",
-        headers=headers,
+        f"{SIDECAR_URL}/AuthorizationHeaderUnauthenticated/"
+        f"{DOWNSTREAM_API_NAME}?AgentIdentity={AGENT_APP_ID}",
+        headers={"Host": "localhost"},
         timeout=15,
     )
     resp.raise_for_status()
@@ -91,91 +81,36 @@ def get_entra_agent_jwt(user_token: str | None = None) -> str:
     log.info("[WIF] Entra JWT received: %s...", auth_header[:80])
     return auth_header.removeprefix("Bearer ")
 
-# ---------------------------------------------------------------------------
-# Anthropic Workload Identity Federation — token exchange
-# ---------------------------------------------------------------------------
-
-def exchange_entra_jwt_for_claude_token(entra_jwt: str) -> str:
-    """
-    Exchange an Entra Agent Identity JWT for a short-lived Anthropic access token
-    using the RFC 7523 jwt-bearer grant (Anthropic Workload Identity Federation).
-
-    POST /v1/oauth/token  (application/x-www-form-urlencoded)
-      grant_type         = urn:ietf:params:oauth:grant-type:jwt-bearer
-      assertion          = <raw Entra JWT>
-      federation_rule_id = fdrl_... (rule configured in Anthropic Console)
-      organization_id    = <Anthropic org UUID>
-      service_account_id = svac_...
-
-    Returns the short-lived Claude access token string.
-    """
-    if not ANTHROPIC_SERVICE_ACCOUNT_ID:
-        raise ValueError("ANTHROPIC_SERVICE_ACCOUNT_ID is not configured")
-    if not ANTHROPIC_ORGANIZATION_ID:
-        raise ValueError("ANTHROPIC_ORGANIZATION_ID is not configured")
-    if not ANTHROPIC_FEDERATION_RULE_ID:
-        raise ValueError("ANTHROPIC_FEDERATION_RULE_ID is not configured")
-
-    token_url = f"{ANTHROPIC_API_BASE}/v1/oauth/token"
-    log.info("[WIF] Exchanging Entra JWT for Claude token at %s", token_url)
-
-    resp = requests.post(
-        token_url,
-        data={
-            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-            "assertion": entra_jwt,
-            "federation_rule_id": ANTHROPIC_FEDERATION_RULE_ID,
-            "organization_id": ANTHROPIC_ORGANIZATION_ID,
-            "service_account_id": ANTHROPIC_SERVICE_ACCOUNT_ID,
-        },
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=15,
-    )
-    resp.raise_for_status()
-
-    body = resp.json()
-    claude_token = body["access_token"]
-    log.info("[WIF] Claude access token obtained (expires_in=%s)", body.get("expires_in", "?"))
-    return claude_token
-
 
 # ---------------------------------------------------------------------------
-# Claude API
+# Anthropic SDK client construction
 # ---------------------------------------------------------------------------
 
-def call_claude(
-    claude_access_token: str,
-    message: str | None = None,
-    system: str | None = None,
-    messages: list[dict] | None = None,
-) -> dict:
+# ---------------------------------------------------------------------------
+# Anthropic SDK client (singleton — lazy init)
+# ---------------------------------------------------------------------------
+
+_client: anthropic.Anthropic | None = None
+
+
+def _get_client() -> anthropic.Anthropic:
+    """Lazily initialise and return the singleton Anthropic client.
+
+    The SDK caches the WIF access token and auto-refreshes it before expiry.
     """
-    Call the Anthropic Claude API using the short-lived access token obtained
-    from the Anthropic WIF token exchange.  No Anthropic API key is used.
-
-    If *messages* (a list of {role, content} dicts) is provided it is sent
-    directly — this enables multi-turn conversations.  Otherwise a single
-    user message is constructed from *message* (backward compatible).
-    """
-    messages_url = f"{ANTHROPIC_API_BASE}/v1/messages"
-    headers = {
-        "Authorization": f"Bearer {claude_access_token}",
-        "Content-Type": "application/json",
-        "anthropic-version": "2023-06-01",
-    }
-
-    payload: dict = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": 1024,
-        "messages": messages if messages else [{"role": "user", "content": message}],
-    }
-    if system:
-        payload["system"] = system
-
-    log.info("[Claude] POST %s model=%s", messages_url, CLAUDE_MODEL)
-    resp = requests.post(messages_url, headers=headers, json=payload, timeout=60)
-    resp.raise_for_status()
-    return resp.json()
+    global _client  # noqa: PLW0603
+    if _client is None:
+        _client = anthropic.Anthropic(
+            base_url=ANTHROPIC_API_BASE,
+            credentials=WorkloadIdentityCredentials(
+                identity_token_provider=_fetch_entra_jwt,
+                federation_rule_id=ANTHROPIC_FEDERATION_RULE_ID,
+                organization_id=ANTHROPIC_ORGANIZATION_ID,
+                service_account_id=ANTHROPIC_SERVICE_ACCOUNT_ID,
+                workspace_id=ANTHROPIC_WORKSPACE_ID,
+            ),
+        )
+    return _client
 
 
 # ---------------------------------------------------------------------------
@@ -198,10 +133,9 @@ def health():
 def chat():
     """
     POST /chat
-    Body: { "message": "...", "system": "..." (optional) }
-    Authorization header (optional): Bearer <Entra user token>  → triggers OBO flow
+    Body: { "message": "...", "messages": [...], "system": "..." (optional) }
 
-    Returns: { "response": "...", "model": "...", "flow": "autonomous|obo" }
+    Returns: { "response": "...", "model": "...", "flow": "autonomous" }
     """
     data = request.get_json(force=True, silent=True) or {}
     messages = data.get("messages")  # multi-turn: [{role, content}, ...]
@@ -211,38 +145,43 @@ def chat():
 
     system = data.get("system")
 
-    # Detect OBO flow: caller passes their own Entra Bearer token
-    user_token: str | None = None
-    incoming_auth = request.headers.get("Authorization", "")
-    if incoming_auth.startswith("Bearer "):
-        user_token = incoming_auth[len("Bearer "):]
-
-    flow = "obo" if user_token else "autonomous"
-
     try:
-        # Step 1 — Sidecar: obtain Entra Agent Identity JWT (WIF or client-credentials)
-        entra_jwt = get_entra_agent_jwt(user_token)
+        client = _get_client()
 
-        # Step 2 — Anthropic WIF: exchange Entra JWT for a short-lived Claude access token
-        claude_token = exchange_entra_jwt_for_claude_token(entra_jwt)
+        # The SDK handles: sidecar JWT → RFC 7523 exchange → token caching → API call
+        kwargs: dict = {
+            "model": CLAUDE_MODEL,
+            "max_tokens": 1024,
+            "messages": messages if messages else [{"role": "user", "content": message}],
+        }
+        if system:
+            kwargs["system"] = system
 
-        # Step 3 — Call Claude API directly with the WIF-derived access token
-        result = call_claude(claude_token, message=message, system=system, messages=messages)
+        log.info("[Claude] messages.create model=%s", CLAUDE_MODEL)
+        result = client.messages.create(**kwargs)
 
-        content_blocks = result.get("content", [])
-        text = content_blocks[0].get("text", "") if content_blocks else ""
+        text = result.content[0].text if result.content else ""
 
         return jsonify({
             "response": text,
-            "model": result.get("model"),
-            "flow": flow,
-            "usage": result.get("usage"),
+            "model": result.model,
+            "flow": "autonomous",
+            "usage": {
+                "input_tokens": result.usage.input_tokens,
+                "output_tokens": result.usage.output_tokens,
+            },
         })
 
-    except requests.HTTPError as exc:
-        log.error("[Error] HTTP %s: %s", exc.response.status_code, exc.response.text)
+    except anthropic.APIStatusError as exc:
+        log.error("[Error] Anthropic API %s: %s", exc.status_code, exc.message)
         return jsonify({
-            "error": f"HTTP {exc.response.status_code}",
+            "error": f"HTTP {exc.status_code}",
+            "details": exc.message,
+        }), 502
+    except requests.HTTPError as exc:
+        log.error("[Error] Sidecar HTTP %s: %s", exc.response.status_code, exc.response.text)
+        return jsonify({
+            "error": f"Sidecar HTTP {exc.response.status_code}",
             "details": exc.response.text,
         }), 502
     except Exception as exc:  # pylint: disable=broad-except

@@ -7,8 +7,9 @@
 # Identity flow:
 #   sidecar (client credentials or WIF/SignedAssertionFromManagedIdentity)
 #     → Entra ID → Agent Identity JWT (scoped to ENTRA_WIF_SCOPE audience)
-#     → agent exchanges JWT at api.anthropic.com/v1/oauth/token (RFC 7523 jwt-bearer)
-#     → short-lived Claude access token → Claude API (api.anthropic.com/v1/messages)
+#     → Anthropic SDK exchanges JWT at api.anthropic.com/v1/oauth/token (RFC 7523)
+#     → short-lived Claude access token (cached + auto-refreshed by SDK)
+#     → Claude API (api.anthropic.com/v1/messages)
 
 services:
 
@@ -55,8 +56,8 @@ services:
 
   # ──────────────────────────────────────────────────────────────────────────
   # Claude agent
-  # Asks the sidecar for an Entra Agent Identity JWT, exchanges it at
-  # api.anthropic.com/v1/oauth/token (Anthropic WIF), then calls Claude.
+  # Asks the sidecar for an Entra Agent Identity JWT.  The Anthropic Python
+  # SDK handles the RFC 7523 token exchange, caching, and auto-refresh.
   # ──────────────────────────────────────────────────────────────────────────
   agent:
     build: ./agent
@@ -69,6 +70,7 @@ services:
       - ANTHROPIC_SERVICE_ACCOUNT_ID=${ANTHROPIC_SERVICE_ACCOUNT_ID}
       - ANTHROPIC_ORGANIZATION_ID=${ANTHROPIC_ORGANIZATION_ID}
       - ANTHROPIC_FEDERATION_RULE_ID=${ANTHROPIC_FEDERATION_RULE_ID}
+      - ANTHROPIC_WORKSPACE_ID=${ANTHROPIC_WORKSPACE_ID:-}
       - CLAUDE_MODEL=${CLAUDE_MODEL:-claude-3-5-sonnet-20241022}
     depends_on:
       - sidecar

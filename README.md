@@ -10,7 +10,7 @@ This project follows the [**Entra Auth SDK (sidecar)**](https://learn.microsoft.
 
 **Yes — via Anthropic's Workload Identity Federation.**
 
-Anthropic supports passwordless authentication through [Workload Identity Federation](https://platform.claude.com/docs/en/build-with-claude/workload-identity-federation): any OIDC-capable identity provider, including **Microsoft Entra**, can issue a signed JWT that is exchanged at `POST https://api.anthropic.com/v1/oauth/token` (RFC 7523 jwt-bearer grant) for a short-lived Claude access token.
+Anthropic supports passwordless authentication through [Workload Identity Federation](https://platform.claude.com/docs/en/build-with-claude/workload-identity-federation): any OIDC-capable identity provider, including **Microsoft Entra**, can issue a signed JWT that is exchanged at `POST https://api.anthropic.com/v1/oauth/token` (RFC 7523 jwt-bearer grant) for a short-lived Claude access token. The last step - token exchange is baked in the [Anthropic SDK](https://platform.claude.com/docs/en/manage-claude/workload-identity-federation#construct-the-sdk-client).
 
 This means an AI Agent using **Entra Agent Identity** can call Claude APIs utilizing its native agentic identity via Entra Agent ID.
 
@@ -30,11 +30,11 @@ This means an AI Agent using **Entra Agent Identity** can call Claude APIs utili
 │  │  :3000 (host: 4192)                   │                                │
 │  │                                       │                                │
 │  │  (1) Receive user query               │                                │
-│  │  (2) Ask sidecar for Entra JWT        │                                │
+│  │  (2) Anthropic SDK needs a token      │                                │
 │  └────────────────┬──────────────────────┘                                │
-│                   │ ③ GET /AuthorizationHeaderUnauthenticated/claude-api  │
-│                   │    ?AgentIdentity=<agentId>                           │
-│                   │    Host: localhost                                     │
+│                   │ ③ identity_token_provider() calls sidecar:            │
+│                   │    GET /AuthorizationHeaderUnauthenticated/claude-api  │
+│                   │    ?AgentIdentity=<agentId>  Host: localhost           │
 │                   ▼                                                       │
 │  ┌───────────────────────────────────────┐  (4) client-creds              │
 │  │  claude-wif-sidecar                   │ ──────────────────────────▶   │
@@ -44,10 +44,11 @@ This means an AI Agent using **Entra Agent Identity** can call Claude APIs utili
 │                   │ (6) raw JWT (aud = app reg. for Anthropic APIs)       │
 │                   ▼                                                       │
 │  ┌───────────────────────────────────────┐  (7) POST /v1/oauth/token      │
-│  │  claude-wif-agent exchanges JWT:      │ ──────────────────────────▶    │
+│  │  Anthropic SDK exchanges JWT:         │ ──────────────────────────▶    │
 │  │  RFC 7523 jwt-bearer grant            │              api.anthropic.com │
-│  │                                       │ ◀──────────────────────────    │
-│  │  (8) short-lived Claude access token  │  short-lived access token       │
+│  │  (automatic — handled by SDK)         │ ◀──────────────────────────    │
+│  │                                       │  short-lived access token       │
+│  │  (8) Token cached + auto-refreshed   │                                │
 │  │                                       │                                │
 │  │  (9) POST /v1/messages                │ ──────────────────────────▶   │
 │  │     Authorization: Bearer <token>     │              api.anthropic.com │
@@ -57,7 +58,7 @@ This means an AI Agent using **Entra Agent Identity** can call Claude APIs utili
 
 ### Key insight
 
-Steps (4) and (5) — An angetic application uses Entra Agent ID to obtain access token for calling the Anthropic APIs. The pattern, or SDK, used is Entra Auth SDK for Agent ID via sidecar container. Step (7) is the only Anthropic-specific step the agent performs: exchanging the Entra JWT for a Claude token via the standard RFC 7523 oauth token endpoint. No MSAL, no certificates, no API keys in agent memory.
+Steps (4) and (5) — An agentic application uses Entra Agent ID to obtain an access token for calling the Anthropic APIs. The pattern used is the Entra Auth SDK for Agent ID via sidecar container. Steps (7)–(9) are handled entirely by the **native Anthropic Python SDK** using `WorkloadIdentityCredentials`: the SDK receives the Entra JWT from a custom `identity_token_provider` callable, exchanges it at the RFC 7523 token endpoint, caches the short-lived Claude access token, auto-refreshes it before expiry, and sends it on every API request. The agent code simply calls `client.messages.create()`. No MSAL, no certificates, no API keys in agent memory.
 
 ---
 
@@ -266,27 +267,12 @@ Expected response:
 
 ---
 
-## OBO (On-Behalf-Of) flow
+## Switching to Managed Identity (Azure deployment)
 
-When a signed-in user's Entra Bearer token is available, pass it in the
-`Authorization` header. The sidecar performs the OBO exchange and mints an
-agent-on-behalf-of-user token, which is then exchanged with Anthropic WIF:
+[Managed identities for Azure resources](https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/overview) is an identity that can be assigned to an Azure compute resource or any App hosting platform supported by Azure and replaces secrets such as access keys or passwords. In addition, managed identities can replace certificates or other forms of authentication for service-to-service dependencies. 
+It is highly recommended that your Azure deplyoed resources use Managed Identities. Should you deploy the sidecar to an Azure Service (e.g. Azure Container Apps, or Azure Kubernetes Services) you can use the Azure Managed Identity to authenticate the Azure Blueprint.
 
-```bash
-curl -s -X POST http://localhost:4192/chat \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <entra-user-token>" \
-  -d '{"message": "Summarise my recent emails."}' | jq .
-```
-
-The response will show `"flow": "obo"`.
-
----
-
-## Switching to true WIF (Azure deployment)
-
-Change **two environment variables** in `docker-compose.yml` (or your
-Container Apps/Kubernetes deployment manifest) — no agent code changes:
+Change **two environment variables** in `docker-compose.yml` (or your Container Apps/Kubernetes deployment manifest) — no agent code changes:
 
 ```yaml
 # docker-compose.yml — sidecar service
