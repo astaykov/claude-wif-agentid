@@ -32,9 +32,9 @@ This means an AI Agent using **Entra Agent Identity** can call Claude APIs utili
 │  │  (1) Receive user query               │                                │
 │  │  (2) Anthropic SDK needs a token      │                                │
 │  └────────────────┬──────────────────────┘                                │
-│                   │ ③ identity_token_provider() calls sidecar:            │
-│                   │    GET /AuthorizationHeaderUnauthenticated/claude-api  │
-│                   │    ?AgentIdentity=<agentId>  Host: localhost           │
+│                   │ (3) identity_token_provider() calls sidecar:          │
+│                   │    GET /AuthorizationHeaderUnauthenticated/claude-api │
+│                   │    ?AgentIdentity=<agentId>  Host: localhost          │
 │                   ▼                                                       │
 │  ┌───────────────────────────────────────┐  (4) client-creds              │
 │  │  claude-wif-sidecar                   │ ──────────────────────────▶   │
@@ -44,11 +44,11 @@ This means an AI Agent using **Entra Agent Identity** can call Claude APIs utili
 │                   │ (6) raw JWT (aud = app reg. for Anthropic APIs)       │
 │                   ▼                                                       │
 │  ┌───────────────────────────────────────┐  (7) POST /v1/oauth/token      │
-│  │  Anthropic SDK exchanges JWT:         │ ──────────────────────────▶    │
+│  │  Anthropic SDK exchanges JWT:         │ ──────────────────────────▶   │
 │  │  RFC 7523 jwt-bearer grant            │              api.anthropic.com │
-│  │  (automatic — handled by SDK)         │ ◀──────────────────────────    │
-│  │                                       │  short-lived access token       │
-│  │  (8) Token cached + auto-refreshed   │                                │
+│  │  (automatic — handled by SDK)         │ ◀──────────────────────────   │
+│  │                                       │  short-lived access token      │
+│  │  (8) Token cached + auto-refreshed    │                                │
 │  │                                       │                                │
 │  │  (9) POST /v1/messages                │ ──────────────────────────▶   │
 │  │     Authorization: Bearer <token>     │              api.anthropic.com │
